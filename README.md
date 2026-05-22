@@ -87,4 +87,6 @@ This is a public-facing repo now, so the README stays focused on the project its
 
 ## License and ownership
 
-This repository contains project code for the host, shim, and compatibility patches. Minecraft, Fabric, Mojang assets, and third-party runtime components remain subject to their own licenses and terms.
+The original project code in this repository is available under the custom terms in [LICENSE](LICENSE): use is allowed with credit, but redistribution is not permitted without prior written permission from veroxsity / BanditVault.
+
+Minecraft, Fabric, Mojang assets, and third-party runtime components remain subject to their own licenses and terms.
