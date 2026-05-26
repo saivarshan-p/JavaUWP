@@ -13,6 +13,7 @@
 #include <windows.applicationmodel.core.h>
 #include <windows.foundation.h>
 #include <windows.foundation.collections.h>
+#include <GameInput.h>
 #include <windows.system.h>
 #include <windows.ui.core.h>
 
@@ -181,6 +182,30 @@ typedef struct { unsigned char buttons[15]; float axes[6]; } GLFWgamepadstate;
 #define GLFW_CURSOR          0x00033001
 #define GLFW_CURSOR_NORMAL   0x00034001
 #define GLFW_CURSOR_DISABLED 0x00034003
+#define GLFW_CONNECTED       0x00040001
+#define GLFW_DISCONNECTED    0x00040002
+#define GLFW_JOYSTICK_1      0
+#define GLFW_GAMEPAD_BUTTON_A             0
+#define GLFW_GAMEPAD_BUTTON_B             1
+#define GLFW_GAMEPAD_BUTTON_X             2
+#define GLFW_GAMEPAD_BUTTON_Y             3
+#define GLFW_GAMEPAD_BUTTON_LEFT_BUMPER   4
+#define GLFW_GAMEPAD_BUTTON_RIGHT_BUMPER  5
+#define GLFW_GAMEPAD_BUTTON_BACK          6
+#define GLFW_GAMEPAD_BUTTON_START         7
+#define GLFW_GAMEPAD_BUTTON_GUIDE         8
+#define GLFW_GAMEPAD_BUTTON_LEFT_THUMB    9
+#define GLFW_GAMEPAD_BUTTON_RIGHT_THUMB   10
+#define GLFW_GAMEPAD_BUTTON_DPAD_UP       11
+#define GLFW_GAMEPAD_BUTTON_DPAD_RIGHT    12
+#define GLFW_GAMEPAD_BUTTON_DPAD_DOWN     13
+#define GLFW_GAMEPAD_BUTTON_DPAD_LEFT     14
+#define GLFW_GAMEPAD_AXIS_LEFT_X          0
+#define GLFW_GAMEPAD_AXIS_LEFT_Y          1
+#define GLFW_GAMEPAD_AXIS_RIGHT_X         2
+#define GLFW_GAMEPAD_AXIS_RIGHT_Y         3
+#define GLFW_GAMEPAD_AXIS_LEFT_TRIGGER    4
+#define GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER   5
 
 #define GL_VENDOR   0x1F00
 #define GL_RENDERER 0x1F01
@@ -265,6 +290,8 @@ static int g_poll_log_count = 0;
 static int g_proc_log_count = 0;
 static int g_wait_log_count = 0;
 static int g_key_log_count = 0;
+static int g_controller_log_count = 0;
+static int g_gamepad_query_log_count = 0;
 
 static PFN_eglGetDisplay p_eglGetDisplay = nullptr;
 static PFN_eglGetPlatformDisplay p_eglGetPlatformDisplay = nullptr;
@@ -310,11 +337,20 @@ using CoreWindowCharHandler = ABI::Windows::Foundation::__FITypedEventHandler_2_
 static ComPtr<CoreWindowKeyHandler> g_keyDownHandler;
 static ComPtr<CoreWindowKeyHandler> g_keyUpHandler;
 static ComPtr<CoreWindowCharHandler> g_charReceivedHandler;
+static ComPtr<IGameInput> g_gameInput;
 static EventRegistrationToken g_keyDownToken = {};
 static EventRegistrationToken g_keyUpToken = {};
 static EventRegistrationToken g_charReceivedToken = {};
 static bool g_keyboardHooksInstalled = false;
+static bool g_gameInputCreateTried = false;
+static bool g_gamepad_present = false;
+static bool g_haveGameInputGamepadState = false;
 static unsigned char g_key_state[512] = {};
+static GameInputGamepadState g_lastGameInputGamepadState = {};
+static GLFWgamepadstate g_gamepad_state = {};
+static float g_joystick_axes[6] = {};
+static unsigned char g_joystick_buttons[15] = {};
+static void* g_joystick_user_pointer = NULL;
 
 static ComPtr<ICoreWindow> g_coreWindow;
 static ComPtr<ICoreDispatcher> g_dispatcher;
@@ -537,6 +573,123 @@ static void DispatchCharEvent(unsigned int codepoint) {
     if (g_charmods_cb) {
         g_charmods_cb((GLFWwindow*)&g_fake_window, codepoint, CurrentGlfwMods());
     }
+}
+
+static bool EnsureGameInput() {
+    if (g_gameInput) return true;
+    if (g_gameInputCreateTried) return false;
+
+    g_gameInputCreateTried = true;
+    HRESULT hr = GameInputCreate(g_gameInput.GetAddressOf());
+    if (FAILED(hr) || !g_gameInput) {
+        ShimLog("GameInputCreate failed hr=0x%08X", hr);
+        return false;
+    }
+
+    g_gameInput->SetFocusPolicy(GameInputExclusiveForegroundInput);
+    ShimLog("GameInput initialized");
+    return true;
+}
+
+static float ClampGamepadAxis(float value) {
+    if (value < -1.0f) return -1.0f;
+    if (value > 1.0f) return 1.0f;
+    return value;
+}
+
+static unsigned char GamepadButton(GameInputGamepadButtons buttons, GameInputGamepadButtons mask) {
+    return (buttons & mask) ? GLFW_PRESS : GLFW_RELEASE;
+}
+
+static void ConvertGameInputGamepadState(const GameInputGamepadState& state) {
+    ZeroMemory(&g_gamepad_state, sizeof(g_gamepad_state));
+    ZeroMemory(g_joystick_axes, sizeof(g_joystick_axes));
+    ZeroMemory(g_joystick_buttons, sizeof(g_joystick_buttons));
+
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_A] = GamepadButton(state.buttons, GameInputGamepadA);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_B] = GamepadButton(state.buttons, GameInputGamepadB);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_X] = GamepadButton(state.buttons, GameInputGamepadX);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_Y] = GamepadButton(state.buttons, GameInputGamepadY);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_LEFT_BUMPER] = GamepadButton(state.buttons, GameInputGamepadLeftShoulder);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_RIGHT_BUMPER] = GamepadButton(state.buttons, GameInputGamepadRightShoulder);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_BACK] = GamepadButton(state.buttons, GameInputGamepadView);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_START] = GamepadButton(state.buttons, GameInputGamepadMenu);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_GUIDE] = GLFW_RELEASE;
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_LEFT_THUMB] = GamepadButton(state.buttons, GameInputGamepadLeftThumbstick);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_RIGHT_THUMB] = GamepadButton(state.buttons, GameInputGamepadRightThumbstick);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_DPAD_UP] = GamepadButton(state.buttons, GameInputGamepadDPadUp);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_DPAD_RIGHT] = GamepadButton(state.buttons, GameInputGamepadDPadRight);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_DPAD_DOWN] = GamepadButton(state.buttons, GameInputGamepadDPadDown);
+    g_gamepad_state.buttons[GLFW_GAMEPAD_BUTTON_DPAD_LEFT] = GamepadButton(state.buttons, GameInputGamepadDPadLeft);
+
+    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_LEFT_X] = ClampGamepadAxis(state.leftThumbstickX);
+    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_LEFT_Y] = ClampGamepadAxis(-state.leftThumbstickY);
+    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_RIGHT_X] = ClampGamepadAxis(state.rightThumbstickX);
+    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_RIGHT_Y] = ClampGamepadAxis(-state.rightThumbstickY);
+    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_LEFT_TRIGGER] = ClampGamepadAxis(state.leftTrigger * 2.0f - 1.0f);
+    g_gamepad_state.axes[GLFW_GAMEPAD_AXIS_RIGHT_TRIGGER] = ClampGamepadAxis(state.rightTrigger * 2.0f - 1.0f);
+
+    memcpy(g_joystick_axes, g_gamepad_state.axes, sizeof(g_joystick_axes));
+    memcpy(g_joystick_buttons, g_gamepad_state.buttons, sizeof(g_joystick_buttons));
+}
+
+static bool PollGameInputGamepad(bool fireCallbacks) {
+    if (!EnsureGameInput()) return false;
+
+    ComPtr<IGameInputReading> reading;
+    HRESULT hr = g_gameInput->GetCurrentReading(GameInputKindGamepad, nullptr, reading.GetAddressOf());
+
+    GameInputGamepadState state = {};
+    const bool present = SUCCEEDED(hr) && reading && reading->GetGamepadState(&state);
+    const bool previousPresent = g_gamepad_present;
+    g_gamepad_present = present;
+
+    if (!present) {
+        ZeroMemory(&g_gamepad_state, sizeof(g_gamepad_state));
+        ZeroMemory(g_joystick_axes, sizeof(g_joystick_axes));
+        ZeroMemory(g_joystick_buttons, sizeof(g_joystick_buttons));
+        g_haveGameInputGamepadState = false;
+
+        if (previousPresent && fireCallbacks && g_joystick_cb) {
+            g_joystick_cb(GLFW_JOYSTICK_1, GLFW_DISCONNECTED);
+        }
+        if (g_controller_log_count < 6) {
+            ++g_controller_log_count;
+            ShimLog("GameInput gamepad unavailable hr=0x%08X", hr);
+        }
+        return false;
+    }
+
+    ConvertGameInputGamepadState(state);
+
+    if (!g_haveGameInputGamepadState) {
+        g_haveGameInputGamepadState = true;
+        g_lastGameInputGamepadState = state;
+        ShimLog("GameInput gamepad ready kind=0x%X buttons=0x%X lt=%.2f rt=%.2f lx=%.2f ly=%.2f rx=%.2f ry=%.2f",
+            reading->GetInputKind(), (unsigned)state.buttons,
+            state.leftTrigger, state.rightTrigger,
+            state.leftThumbstickX, state.leftThumbstickY,
+            state.rightThumbstickX, state.rightThumbstickY);
+    } else if (g_controller_log_count < 24 &&
+        (state.buttons != g_lastGameInputGamepadState.buttons ||
+         state.leftTrigger != g_lastGameInputGamepadState.leftTrigger ||
+         state.rightTrigger != g_lastGameInputGamepadState.rightTrigger ||
+         state.leftThumbstickX != g_lastGameInputGamepadState.leftThumbstickX ||
+         state.leftThumbstickY != g_lastGameInputGamepadState.leftThumbstickY ||
+         state.rightThumbstickX != g_lastGameInputGamepadState.rightThumbstickX ||
+         state.rightThumbstickY != g_lastGameInputGamepadState.rightThumbstickY)) {
+        ++g_controller_log_count;
+        ShimLog("GameInput gamepad state buttons=0x%X lt=%.2f rt=%.2f lx=%.2f ly=%.2f rx=%.2f ry=%.2f",
+            (unsigned)state.buttons, state.leftTrigger, state.rightTrigger,
+            state.leftThumbstickX, state.leftThumbstickY,
+            state.rightThumbstickX, state.rightThumbstickY);
+        g_lastGameInputGamepadState = state;
+    }
+
+    if (!previousPresent && fireCallbacks && g_joystick_cb) {
+        g_joystick_cb(GLFW_JOYSTICK_1, GLFW_CONNECTED);
+    }
+    return true;
 }
 
 static bool InstallKeyboardHooks() {
@@ -1212,6 +1365,7 @@ extern "C" __declspec(dllexport) void glfwPollEvents(void) {
     if (g_dispatcher) {
         g_dispatcher->ProcessEvents(CoreProcessEventsOption_ProcessAllIfPresent);
     }
+    PollGameInputGamepad(true);
     RefreshWindowMetrics(true);
 }
 extern "C" __declspec(dllexport) void glfwWaitEvents(void) {
@@ -1366,19 +1520,90 @@ extern "C" __declspec(dllexport) void glfwSetGamma(GLFWmonitor*, float) {}
 extern "C" __declspec(dllexport) const GLFWgammaramp* glfwGetGammaRamp(GLFWmonitor*) { return NULL; }
 extern "C" __declspec(dllexport) void glfwSetGammaRamp(GLFWmonitor*, const GLFWgammaramp*) {}
 
-extern "C" __declspec(dllexport) int glfwJoystickPresent(int) { return GLFW_FALSE; }
-extern "C" __declspec(dllexport) const float* glfwGetJoystickAxes(int, int*c) { if(c)*c=0; return NULL; }
-extern "C" __declspec(dllexport) const unsigned char* glfwGetJoystickButtons(int, int*c) { if(c)*c=0; return NULL; }
+static bool IsSupportedJoystick(int jid) {
+    return jid == GLFW_JOYSTICK_1;
+}
+
+static void LogGamepadQuery(const char* api, int jid, bool result) {
+    if (g_gamepad_query_log_count >= 32) return;
+    ++g_gamepad_query_log_count;
+    ShimLog("%s jid=%d -> %d", api, jid, result ? 1 : 0);
+}
+
+extern "C" __declspec(dllexport) int glfwJoystickPresent(int jid) {
+    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false);
+    LogGamepadQuery("glfwJoystickPresent", jid, result);
+    return result ? GLFW_TRUE : GLFW_FALSE;
+}
+extern "C" __declspec(dllexport) const float* glfwGetJoystickAxes(int jid, int*c) {
+    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false);
+    LogGamepadQuery("glfwGetJoystickAxes", jid, result);
+    if (!result) {
+        if(c)*c=0;
+        return NULL;
+    }
+    if(c)*c=(int)(sizeof(g_joystick_axes) / sizeof(g_joystick_axes[0]));
+    return g_joystick_axes;
+}
+extern "C" __declspec(dllexport) const unsigned char* glfwGetJoystickButtons(int jid, int*c) {
+    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false);
+    LogGamepadQuery("glfwGetJoystickButtons", jid, result);
+    if (!result) {
+        if(c)*c=0;
+        return NULL;
+    }
+    if(c)*c=(int)(sizeof(g_joystick_buttons) / sizeof(g_joystick_buttons[0]));
+    return g_joystick_buttons;
+}
 extern "C" __declspec(dllexport) const unsigned char* glfwGetJoystickHats(int, int*c) { if(c)*c=0; return NULL; }
-extern "C" __declspec(dllexport) const char* glfwGetJoystickName(int) { return NULL; }
-extern "C" __declspec(dllexport) const char* glfwGetJoystickGUID(int) { return NULL; }
-extern "C" __declspec(dllexport) void  glfwSetJoystickUserPointer(int, void*) {}
-extern "C" __declspec(dllexport) void* glfwGetJoystickUserPointer(int) { return NULL; }
-extern "C" __declspec(dllexport) int   glfwJoystickIsGamepad(int) { return GLFW_FALSE; }
-extern "C" __declspec(dllexport) GLFWjoystickfun glfwSetJoystickCallback(GLFWjoystickfun cb) { GLFWjoystickfun p=g_joystick_cb; g_joystick_cb=cb; return p; }
-extern "C" __declspec(dllexport) int  glfwUpdateGamepadMappings(const char*) { return GLFW_FALSE; }
-extern "C" __declspec(dllexport) const char* glfwGetGamepadName(int) { return NULL; }
-extern "C" __declspec(dllexport) int  glfwGetGamepadState(int, GLFWgamepadstate*) { return GLFW_FALSE; }
+extern "C" __declspec(dllexport) const char* glfwGetJoystickName(int jid) {
+    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false);
+    LogGamepadQuery("glfwGetJoystickName", jid, result);
+    return result ? "Xbox Controller" : NULL;
+}
+extern "C" __declspec(dllexport) const char* glfwGetJoystickGUID(int jid) {
+    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false);
+    LogGamepadQuery("glfwGetJoystickGUID", jid, result);
+    return result ? "030000005e0400008e02000000000000" : NULL;
+}
+extern "C" __declspec(dllexport) void  glfwSetJoystickUserPointer(int jid, void* pointer) {
+    if (jid == GLFW_JOYSTICK_1) g_joystick_user_pointer = pointer;
+}
+extern "C" __declspec(dllexport) void* glfwGetJoystickUserPointer(int jid) {
+    return jid == GLFW_JOYSTICK_1 ? g_joystick_user_pointer : NULL;
+}
+extern "C" __declspec(dllexport) int   glfwJoystickIsGamepad(int jid) {
+    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false);
+    LogGamepadQuery("glfwJoystickIsGamepad", jid, result);
+    return result ? GLFW_TRUE : GLFW_FALSE;
+}
+extern "C" __declspec(dllexport) GLFWjoystickfun glfwSetJoystickCallback(GLFWjoystickfun cb) {
+    GLFWjoystickfun p = g_joystick_cb;
+    g_joystick_cb = cb;
+    if (g_gamepad_query_log_count < 32) {
+        ++g_gamepad_query_log_count;
+        ShimLog("glfwSetJoystickCallback cb=%p", cb);
+    }
+    if (cb) {
+        PollGameInputGamepad(false);
+    }
+    return p;
+}
+extern "C" __declspec(dllexport) int  glfwUpdateGamepadMappings(const char*) { return GLFW_TRUE; }
+extern "C" __declspec(dllexport) const char* glfwGetGamepadName(int jid) {
+    const bool result = IsSupportedJoystick(jid) && PollGameInputGamepad(false);
+    LogGamepadQuery("glfwGetGamepadName", jid, result);
+    return result ? "Xbox Controller" : NULL;
+}
+extern "C" __declspec(dllexport) int  glfwGetGamepadState(int jid, GLFWgamepadstate* state) {
+    const bool result = state && IsSupportedJoystick(jid) && PollGameInputGamepad(false);
+    LogGamepadQuery("glfwGetGamepadState", jid, result);
+    if (!result) {
+        return GLFW_FALSE;
+    }
+    memcpy(state, &g_gamepad_state, sizeof(g_gamepad_state));
+    return GLFW_TRUE;
+}
 
 extern "C" __declspec(dllexport) HWND  glfwGetWin32Window(GLFWwindow*) { return NULL; }
 extern "C" __declspec(dllexport) void* glfwGetWGLContext(GLFWwindow*) { return NULL; }
