@@ -126,6 +126,13 @@ OpenAL.dll
 
 Input that information and your username into app.cpp around lines 570 - 578, replacing the placeholder credentials.
 
+```cpp
+# replace these with your credentials
+"--username", "DevPlayer",                              # replace with your username
+"--uuid", "00000000-0000-0000-0000-000000000000",       # replace with your account uuid
+"--accessToken", "0",                                   # replace with your bearer token
+```
+
 ## Generate Fabric remapped jars
 
 Fabric remapped jars are created by running the Fabric client once on the local desktop cache. This step is needed before the compatibility mod can compile.
